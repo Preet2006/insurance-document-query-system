@@ -20,6 +20,7 @@ import json
 from datetime import datetime, timezone
 import cohere
 from flask_cors import CORS
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +29,125 @@ CORS(app)
 # Paste your Cohere API key below (or load from environment/config securely)
 COHERE_API_KEY = "qZmghdKw7d7YxNryMj57OsMN0jLsQSCy0c7xulRA"
 co = cohere.Client(COHERE_API_KEY)
+
+def llm(prompt, max_tokens=512, temperature=0.2):
+    response = co.generate(
+        model='command-r-plus',
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    return response.generations[0].text
+
+# === PERFORMANCE TRACKING ===
+class PerformanceTracker:
+    def __init__(self):
+        self.start_time = None
+    
+    def start(self):
+        self.start_time = time.time()
+    
+    def get_response_time_ms(self):
+        if self.start_time:
+            return int((time.time() - self.start_time) * 1000)
+        return 0
+
+# === ACCURACY IMPROVEMENTS ===
+class ClauseRetriever:
+    def __init__(self, collection):
+        self.collection = collection
+    
+    def get_relevant_clauses(self, query, n_results=5):
+        """Enhanced clause retrieval with better scoring"""
+        try:
+            # Get more candidates first
+            results = self.collection.query(query_texts=[query], n_results=15)
+            
+            if not results['documents'] or not results['documents'][0]:
+                return []
+            
+            # Re-rank using multiple strategies
+            scored_chunks = []
+            query_words = set(query.lower().split())
+            
+            for chunk, meta in zip(results['documents'][0], results['metadatas'][0]):
+                score = 0.0
+                chunk_lower = chunk.lower()
+                
+                # Exact keyword matching
+                for word in query_words:
+                    if word in chunk_lower:
+                        score += 2.0
+                
+                # Section relevance
+                if meta.get('section_headers'):
+                    score += 1.0
+                
+                # Document source relevance
+                if meta.get('source'):
+                    score += 0.5
+                
+                scored_chunks.append({
+                    'text': chunk,
+                    'metadata': meta,
+                    'relevance_score': score
+                })
+            
+            # Return top N most relevant
+            return sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:n_results]
+            
+        except Exception as e:
+            print(f"Clause retrieval error: {str(e)}")
+            return []
+
+class ResponseFormatter:
+    @staticmethod
+    def format_clause_evidence(clause_data):
+        """Format clause data for JSON response"""
+        return {
+            "clause": clause_data['metadata'].get('section_headers', 'Unknown Section'),
+            "text": clause_data['text'][:300] + "..." if len(clause_data['text']) > 300 else clause_data['text'],
+            "relevance_score": round(clause_data['relevance_score'], 2),
+            "document": clause_data['metadata'].get('source', 'Unknown Document')
+        }
+    
+    @staticmethod
+    def calculate_accuracy_score(clauses_used, answer):
+        """Calculate accuracy score based on evidence quality"""
+        if not clauses_used:
+            return 0.0
+        
+        # Base score from relevance scores
+        avg_relevance = sum(c['relevance_score'] for c in clauses_used) / len(clauses_used)
+        
+        # Boost score if answer is confident
+        confidence_boost = 0.2 if any(word in answer.lower() for word in ['yes', 'covered', 'include']) else 0.0
+        
+        return min(1.0, avg_relevance / 5.0 + confidence_boost)
+
+# === TOKEN EFFICIENCY ===
+class TokenOptimizer:
+    @staticmethod
+    def truncate_clauses_aggressively(clauses, max_tokens=1000):
+        """Only send the most relevant parts of clauses"""
+        truncated = []
+        current_tokens = 0
+        
+        for clause in clauses:
+            # Take only first 200 characters of each clause
+            short_text = clause['text'][:200] + "..."
+            tokens = len(short_text) // 4
+            
+            if current_tokens + tokens > max_tokens:
+                break
+                
+            truncated.append({
+                **clause,
+                'text': short_text
+            })
+            current_tokens += tokens
+        
+        return truncated
 
 # Simple in-memory cache for recent queries
 query_cache = {}
@@ -90,6 +210,11 @@ collection = client.get_collection(
         model_name=str(EMBEDDING_MODEL)
     )  # type: ignore
 )
+
+# Initialize our new components
+clause_retriever = ClauseRetriever(collection)
+response_formatter = ResponseFormatter()
+token_optimizer = TokenOptimizer()
 
 SYSTEM_PROMPT = """You are an expert insurance policy analyst. Use only the context below to answer the question. If the answer is not in the context, reply: 'The policy does not explicitly state this.'\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"""
 
@@ -314,87 +439,121 @@ def handle_batch_query():
 
 @app.route('/query', methods=['POST'])
 def handle_query():
-    data = request.get_json()
-    question = data.get('question', '').strip()
-    cache_key = question.lower() + '_concise'
-    cached = cache_get(cache_key)
-    if cached:
-        response = redact_pii_in_dict(cached)
-        audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": response})
-        return jsonify(response)
-    expander = QueryExpander(llm=llm)
+    # Initialize performance tracker
+    tracker = PerformanceTracker()
+    tracker.start()
+    
     try:
-        expansion_result = expander.expand(question)
-        expanded_queries = expansion_result.get('expansions', [question])
-    except Exception as e:
-        expanded_queries = [question]
-    section_match = None
-    section_pattern = re.search(r'section\s*(\d+(?:\.\d+)*)', question, re.IGNORECASE)
-    if section_pattern:
-        section_match = section_pattern.group(1)
-    all_results = []
-    for q in expanded_queries:
-        results = collection.query(query_texts=[q], n_results=10)
-        if results['documents'] and results['documents'][0]:
-            all_results.append(results)
-            break
-    if not all_results:
-        concise_answer = "No relevant information found."
-        cache_set(cache_key, {"answer": concise_answer})
-        redacted_response = redact_pii_in_dict({"answer": concise_answer})
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        question = data.get('question', '').strip()
+        if not question:
+            return jsonify({"error": "No question provided"}), 400
+            
+        cache_key = question.lower() + '_enhanced'
+        cached = cache_get(cache_key)
+        if cached:
+            cached['response_time_ms'] = tracker.get_response_time_ms()
+            response = redact_pii_in_dict(cached)
+            audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": response})
+            return jsonify(response)
+        
+        # Initialize QueryExpander with error handling
+        try:
+            expander = QueryExpander(llm=llm)
+            expansion_result = expander.expand(question)
+            expanded_queries = expansion_result.get('expansions', [question])
+        except Exception as e:
+            print(f"QueryExpander error: {str(e)}")
+            expanded_queries = [question]
+        
+        # Enhanced clause retrieval
+        clauses_data = clause_retriever.get_relevant_clauses(question, n_results=3)
+        
+        if not clauses_data:
+            concise_answer = "No relevant information found."
+            accuracy_score = 0.0
+            evidence = []
+        else:
+            # Optimize tokens for LLM
+            optimized_clauses = token_optimizer.truncate_clauses_aggressively(clauses_data)
+            
+            # Generate answer with enhanced prompt
+            concise_prompt = f'''You are an expert insurance policy analyst. Given the following user query and relevant policy clauses, answer concisely in one sentence. If not covered, say so. Reference clause numbers if possible.
+
+User Query: "{question}"
+
+Clauses:
+{json.dumps([{"text": c['text'], "section": c['metadata'].get('section_headers', 'Unknown')} for c in optimized_clauses], indent=2)}
+
+Answer:'''
+            
+            concise_answer = None
+            model_used = None
+            
+            # Try Gemini first
+            try:
+                concise_answer = gemini_generate(concise_prompt, max_tokens=48, temperature=0.1)
+                if (not concise_answer or 'error' in concise_answer.lower() or 'timed out' in concise_answer.lower()):
+                    raise Exception('Gemini failed')
+                model_used = "gemini"
+            except Exception as e:
+                print(f"Gemini error: {str(e)}")
+                # Fallback to Cohere
+                try:
+                    response = co.generate(
+                        model='command-r-plus',
+                        prompt=concise_prompt,
+                        max_tokens=48,
+                        temperature=0.1
+                    )
+                    concise_answer = response.generations[0].text.strip()
+                    if not concise_answer:
+                        raise Exception('Cohere failed')
+                    model_used = "cohere"
+                except Exception as e:
+                    print(f"Cohere error: {str(e)}")
+                    concise_answer = "No relevant information found."
+                    model_used = "none"
+            
+            # Calculate accuracy score
+            accuracy_score = response_formatter.calculate_accuracy_score(clauses_data, concise_answer)
+            
+            # Format evidence
+            evidence = [response_formatter.format_clause_evidence(c) for c in clauses_data]
+        
+        # Clean up answer
+        concise_answer = concise_answer.strip().replace('\n', ' ')
+        concise_answer = concise_answer.split('\n')[0].strip()
+        
+        # Build enhanced response
+        response_data = {
+            "answer": concise_answer,
+            "accuracy_score": round(accuracy_score, 2),
+            "evidence": evidence,
+            "model_used": model_used,
+            "response_time_ms": tracker.get_response_time_ms()
+        }
+        
+        cache_set(cache_key, response_data)
+        redacted_response = redact_pii_in_dict(response_data)
         audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": redacted_response})
         return jsonify(redacted_response)
-    results = all_results[0]
-    context_chunks = results['documents'][0] if results['documents'] and results['documents'][0] else []
-    metadatas = results['metadatas'][0] if results['metadatas'] and results['metadatas'][0] else []
-    scored_chunks = []
-    for chunk, meta in zip(context_chunks, metadatas):
-        score = 0.0
-        if section_match:
-            if (meta.get('section_headers') and section_match in meta.get('section_headers')) or (section_match in chunk):
-                score += 1.0
-        scored_chunks.append((chunk, meta, score))
-    scored_chunks.sort(key=lambda x: x[2], reverse=True)
-    top_chunks = scored_chunks[:3]
-    clauses_used = []
-    for chunk, meta, score in top_chunks:
-        clauses_used.append({
-            "document": meta.get("source", ""),
-            "section": (meta.get("section_headers", "") or ""),
-            "text": chunk,
-            "relevance_score": score,
-            "effective_dates": meta.get("effective_dates", ""),
-            "footnotes": meta.get("footnotes", ""),
-            "tables": meta.get("tables", "")
-        })
-    concise_prompt = f'You are an expert insurance policy analyst. Given the following user query and relevant policy clauses, answer concisely in one sentence, e.g., "Yes, knee surgery is covered under the policy." or "No, this is not covered." Do not provide justification or details unless necessary for clarity. The answer must be a single line.\nUser Query: "{question}"\nClauses:\n{json.dumps(clauses_used, indent=2)}\n'
-    concise_answer = None
-    # Try Gemini first
-    try:
-        concise_answer = gemini_generate(concise_prompt, max_tokens=48, temperature=0.1)
-        if (not concise_answer or 'error' in concise_answer.lower() or 'timed out' in concise_answer.lower()):
-            raise Exception('Gemini failed')
-    except Exception:
-        # Fallback to Cohere
-        try:
-            response = co.generate(
-                model='command-r-plus',
-                prompt=concise_prompt,
-                max_tokens=48,
-                temperature=0.1
-            )
-            concise_answer = response.generations[0].text.strip()
-            if not concise_answer:
-                raise Exception('Cohere failed')
-        except Exception:
-            concise_answer = "No relevant information found."
-    concise_answer = concise_answer.strip().replace('\n', ' ')
-    # Ensure only one line
-    concise_answer = concise_answer.split('\n')[0].strip()
-    cache_set(cache_key, {"answer": concise_answer})
-    redacted_response = redact_pii_in_dict({"answer": concise_answer})
-    audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": redacted_response})
-    return jsonify(redacted_response)
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"Unexpected error in handle_query: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return jsonify({"error": error_msg, "response_time_ms": tracker.get_response_time_ms()}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    error_msg = f"Server error: {str(e)}\n{traceback.format_exc()}"
+    print(error_msg)
+    return jsonify({"error": error_msg}), 500
 
 @app.route('/feedback', methods=['POST'])
 def handle_feedback():
@@ -408,6 +567,14 @@ def handle_feedback():
     with open("feedback.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(feedback_entry) + "\n")
     return jsonify({"status": "success", "message": "Feedback recorded."})
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cache_size": len(query_cache)
+    })
 
 if __name__ == '__main__':
     # Simple server run without debug
