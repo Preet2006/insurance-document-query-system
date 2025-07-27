@@ -528,7 +528,7 @@ Answer:'''
         concise_answer = concise_answer.strip().replace('\n', ' ')
         concise_answer = concise_answer.split('\n')[0].strip()
         
-        # Build enhanced response
+        # Build enhanced response (keep full data for cache and audit)
         response_data = {
             "answer": concise_answer,
             "accuracy_score": round(accuracy_score, 2),
@@ -540,7 +540,9 @@ Answer:'''
         cache_set(cache_key, response_data)
         redacted_response = redact_pii_in_dict(response_data)
         audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": redacted_response})
-        return jsonify(redacted_response)
+        
+        # Return only the answer field to the user
+        return jsonify({"answer": redacted_response["answer"]})
         
     except Exception as e:
         import traceback
