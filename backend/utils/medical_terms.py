@@ -24,7 +24,21 @@ MEDICAL_SYNONYMS = {
     "organ donor": ["organ donation", "donor expenses", "transplant donor", "donor care"],
     "grace period": ["payment extension", "premium grace", "payment window", "renewal grace"],
     "no claim discount": ["NCD", "claim free discount", "no claim bonus", "loyalty discount"],
-    "sum insured": ["coverage amount", "policy limit", "maximum benefit", "coverage limit"]
+    "sum insured": ["coverage amount", "policy limit", "maximum benefit", "coverage limit"],
+    "dependent": ["dependents", "family member", "covered person", "beneficiary", "insured family"],
+    "parents": ["parent", "father", "mother", "parents-in-law", "elderly dependent"],
+    "spouse": ["husband", "wife", "partner", "married partner", "life partner"],
+    "children": ["child", "son", "daughter", "kids", "offspring", "minor dependent"],
+    "family": ["family members", "household", "relatives", "kin", "family unit"],
+    "definition": ["means", "shall mean", "defined as", "refers to", "includes", "covers"],
+    "coverage": ["covered", "benefits", "protection", "insurance", "policy benefits"],
+    "exclusion": ["excluded", "not covered", "exceptions", "limitations", "restrictions"],
+    "grace period": ["payment grace", "premium grace", "grace days", "payment extension", "renewal grace", "thirty days", "30 days"],
+    "premium payment": ["premium", "payment", "due date", "payment due", "premium due", "renewal payment"],
+    "policy renewal": ["renewal", "renew", "continue policy", "policy continuation", "renewal date"],
+    "continuity benefits": ["continuity", "continuous coverage", "uninterrupted coverage", "benefit continuity"],
+    "thirty days": ["30 days", "grace period", "payment grace", "thirty day", "one month"],
+    "due date": ["payment due", "premium due", "renewal due", "expiry date", "maturity date"]
 }
 
 # Cache for dynamic synonyms

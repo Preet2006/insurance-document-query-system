@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 import cohere
 from flask_cors import CORS
 import time
+from io import BytesIO
+import tempfile
+from PyPDF2 import PdfReader
+import docx
 
 app = Flask(__name__)
 CORS(app)
@@ -257,7 +261,7 @@ def analyze_decision(answer, clauses_used):
         decision = "pending"
         summary = "A waiting period applies."
     elif "network hospital" in answer_lc:
-        decision = "pending"
+        decision = "pendingvi"
         summary = "Coverage depends on network hospital status."
     return decision, coverage_amount, summary
 
@@ -460,103 +464,160 @@ def handle_query():
             audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": response})
             return jsonify(response)
         
-        # Initialize QueryExpander with error handling
+        print(f"\n=== PROCESSING QUESTION: {question} ===")
+        
+        # IMPROVED EVIDENCE RETRIEVAL - Much more aggressive and comprehensive
+        # Get many more candidates for better coverage
+        results = collection.query(query_texts=[question], n_results=30)
+        
+        if not results['documents'] or not results['documents'][0]:
+            return jsonify({"answer": "No relevant information found in the policy documents."})
+        
+        # Extract ALL meaningful keywords from question
+        question_lower = question.lower()
+        question_words = [word.strip('.,?!()[]{}"') for word in question_lower.split() if len(word.strip('.,?!()[]{}"')) > 2]
+        
+        # Enhanced keyword extraction based on question type
+        all_keywords = set(question_words)
+        if 'grace' in question_lower or 'period' in question_lower:
+            all_keywords.update(['grace', 'period', 'grace period', 'thirty', '30', 'days', 'payment', 'premium', 'due', 'renewal', 'continue', 'continuity'])
+        if 'premium' in question_lower:
+            all_keywords.update(['premium', 'payment', 'due', 'grace', 'renewal', 'continue', 'continuity'])
+        if 'parent' in question_lower or 'dependent' in question_lower:
+            all_keywords.update(['parent', 'parents', 'dependent', 'dependents', 'family', 'spouse', 'children'])
+        if 'waiting' in question_lower:
+            all_keywords.update(['waiting', 'period', 'exclusion', 'months', 'days'])
+        if 'coverage' in question_lower or 'covered' in question_lower:
+            all_keywords.update(['coverage', 'covered', 'benefit', 'include', 'exclude'])
+        
+        # Score and rank chunks with multiple strategies
+        scored_chunks = []
+        for i, (chunk, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+            score = 0.0
+            chunk_lower = chunk.lower()
+            
+            # Keyword matching score (most important)
+            keyword_matches = sum(1 for keyword in all_keywords if keyword in chunk_lower)
+            score += keyword_matches * 3.0
+            
+            # Exact phrase matching (very important)
+            if 'grace period' in question_lower and 'grace period' in chunk_lower:
+                score += 10.0
+            if 'thirty days' in chunk_lower or '30 days' in chunk_lower:
+                score += 8.0
+            if 'premium payment' in question_lower and 'premium' in chunk_lower and 'payment' in chunk_lower:
+                score += 8.0
+            
+            # Section relevance
+            if metadata and metadata.get('section_headers'):
+                score += 2.0
+            
+            # Length bonus for substantial chunks
+            if len(chunk) > 200:
+                score += 1.0
+            
+            scored_chunks.append({
+                'text': chunk,
+                'metadata': metadata or {},
+                'score': score,
+                'keyword_matches': keyword_matches
+            })
+        
+        # Sort by score and take top chunks
+        scored_chunks.sort(key=lambda x: x['score'], reverse=True)
+        top_chunks = scored_chunks[:15]
+        
+        print(f"Top 5 chunks by score:")
+        for i, chunk in enumerate(top_chunks[:5]):
+            print(f"Chunk {i+1} (score: {chunk['score']}, keywords: {chunk['keyword_matches']}): {chunk['text'][:200]}...")
+        
+        # Prepare evidence with more context (800 chars instead of 400)
+        evidence_chunks = []
+        total_tokens = 0
+        for chunk in top_chunks:
+            chunk_text = chunk['text'][:800] + ("..." if len(chunk['text']) > 800 else "")
+            tokens = len(chunk_text) // 4
+            if total_tokens + tokens > 600:  # Increased token limit
+                break
+            evidence_chunks.append({
+                'text': chunk_text,
+                'section': chunk['metadata'].get('section_headers', 'Policy Document'),
+                'score': chunk['score']
+            })
+            total_tokens += tokens
+        
+        # IMPROVED PROMPT - Much more specific and balanced
+        enhanced_prompt = f'''You are an expert insurance policy analyst. Based on the policy clauses below, answer the user's question accurately and comprehensively.
+
+IMPORTANT INSTRUCTIONS:
+- If the information exists in the clauses, provide a detailed answer starting with "Yes," or "No," as appropriate
+- Include specific details like amounts, time periods, conditions, and section references
+- If coverage exists, explain the conditions and limits clearly
+- If something is excluded, explain why and reference the exclusion
+- Maximum 2 lines, but be comprehensive and specific
+- Only say "The policy does not specify" if the information is truly not present
+
+User Question: "{question}"
+
+Policy Clauses:
+{json.dumps(evidence_chunks, indent=2)}
+
+Detailed Answer:'''
+        
+        # Generate answer with fallback logic
+        final_answer = None
+        model_used = None
+        
+        # Try Gemini first with higher token limit
         try:
-            expander = QueryExpander(llm=llm)
-            expansion_result = expander.expand(question)
-            expanded_queries = expansion_result.get('expansions', [question])
-        except Exception as e:
-            print(f"QueryExpander error: {str(e)}")
-            expanded_queries = [question]
-        
-        # Enhanced clause retrieval
-        clauses_data = clause_retriever.get_relevant_clauses(question, n_results=8)
-        
-        if not clauses_data:
-            concise_answer = "No relevant information found."
-            accuracy_score = 0.0
-            evidence = []
-        else:
-            # Optimize tokens for LLM
-            # Aggressively truncate each clause to 400 chars for latency
-            optimized_clauses = []
-            current_tokens = 0
-            for clause in clauses_data:
-                short_text = clause['text'][:400] + ("..." if len(clause['text']) > 400 else "")
-                tokens = len(short_text) // 4
-                if current_tokens + tokens > 250:
-                    break
-                optimized_clauses.append({**clause, 'text': short_text})
-                current_tokens += tokens
-            
-            # Generate answer with enhanced prompt
-            concise_prompt = f'''You are an expert insurance policy analyst. Given the following user query and relevant policy clauses, answer in a single line starting with 'Yes,' or 'No,' as appropriate, followed by a brief reason or key detail (such as coverage amount, waiting period, or main condition). If the information is not present, reply: 'Coverage for [topic] is not specified in the policy.' Do not use hedging language. Be concise and specific.
-
-User Query: "{question}"
-
-Clauses:
-{json.dumps([{"text": c['text'], "section": c['metadata'].get('section_headers', 'Unknown')} for c in optimized_clauses], indent=2)}
-
-Answer:'''
-            
-            concise_answer = None
-            model_used = None
-            
-            # Try Gemini first
-            try:
-                concise_answer = gemini_generate(concise_prompt, max_tokens=48, temperature=0.1)
-                if (not concise_answer or 'error' in concise_answer.lower() or 'timed out' in concise_answer.lower()):
-                    raise Exception('Gemini failed')
+            final_answer = gemini_generate(enhanced_prompt, max_tokens=150, temperature=0.1)
+            if final_answer and 'error' not in final_answer.lower() and 'timed out' not in final_answer.lower():
                 model_used = "gemini"
-            except Exception as e:
-                print(f"Gemini error: {str(e)}")
-                # Fallback to Cohere
-                try:
-                    response = co.generate(
-                        model='command-r-plus',
-                        prompt=concise_prompt,
-                        max_tokens=48,
-                        temperature=0.1
-                    )
-                    concise_answer = response.generations[0].text.strip()
-                    if not concise_answer:
-                        raise Exception('Cohere failed')
+            else:
+                raise Exception('Gemini failed or returned error')
+        except Exception as e:
+            print(f"Gemini error: {str(e)}")
+            # Fallback to Cohere
+            try:
+                response = co.generate(
+                    model='command-r-plus',
+                    prompt=enhanced_prompt,
+                    max_tokens=150,
+                    temperature=0.1
+                )
+                final_answer = response.generations[0].text.strip()
+                if final_answer:
                     model_used = "cohere"
-                except Exception as e:
-                    print(f"Cohere error: {str(e)}")
-                    concise_answer = "No relevant information found."
-                    model_used = "none"
-            
-            # Calculate accuracy score
-            accuracy_score = response_formatter.calculate_accuracy_score(clauses_data, concise_answer)
-            
-            # Format evidence
-            evidence = [response_formatter.format_clause_evidence(c) for c in clauses_data]
-            print("---- Evidence Chunks ----")
-            for i, e in enumerate(evidence):
-                print(f"Chunk {i+1}: {e['text'][:300]}")
-                print(f"Section: {e['clause']}, Document: {e['document']}")
-                print("------------------------")
+                else:
+                    raise Exception('Cohere returned empty response')
+            except Exception as e:
+                print(f"Cohere error: {str(e)}")
+                final_answer = "Unable to process the question due to technical issues."
+                model_used = "none"
         
         # Clean up answer
-        concise_answer = concise_answer.strip().replace('\n', ' ')
-        concise_answer = concise_answer.split('\n')[0].strip()
+        if final_answer:
+            final_answer = final_answer.strip()
+            # Ensure max 2 lines
+            lines = final_answer.split('\n')
+            if len(lines) > 2:
+                final_answer = '\n'.join(lines[:2])
         
-        # Build enhanced response (keep full data for cache and audit)
+        print(f"Final answer: {final_answer}")
+        print(f"Model used: {model_used}")
+        print("=== END PROCESSING ===")
+        
+        # Build response
         response_data = {
-            "answer": concise_answer,
-            "accuracy_score": round(accuracy_score, 2),
-            "evidence": evidence,
+            "answer": final_answer,
             "model_used": model_used,
             "response_time_ms": tracker.get_response_time_ms()
         }
         
         cache_set(cache_key, response_data)
-        redacted_response = redact_pii_in_dict(response_data)
-        audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": redacted_response})
+        audit_log({"timestamp": datetime.now(timezone.utc).isoformat(), "endpoint": "/query", "question": question, "response": response_data})
         
-        # Return only the answer field to the user
-        return jsonify({"answer": redacted_response["answer"]})
+        return jsonify({"answer": final_answer})
         
     except Exception as e:
         import traceback
@@ -591,6 +652,312 @@ def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "cache_size": len(query_cache)
     })
+
+@app.route('/hackrx/run', methods=['POST'])
+def hackrx_run():
+    """
+    Accepts a JSON body with:
+    {
+        "question": "...",
+        "documents": ["url1", "url2", ...]
+    }
+    Downloads and processes the documents at runtime, then answers the question using the same logic as /query.
+    """
+    tracker = PerformanceTracker()
+    tracker.start()
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        question = data.get('question', '').strip()
+        doc_urls = data.get('documents', [])
+        if not question:
+            return jsonify({"error": "No question provided"}), 400
+        
+        # Handle both string and array formats for documents
+        if not doc_urls:
+            return jsonify({"error": "No documents provided"}), 400
+        
+        # Convert string to list if needed
+        if isinstance(doc_urls, str):
+            doc_urls = [doc_urls]
+        elif not isinstance(doc_urls, list):
+            return jsonify({"error": "Documents should be a string URL or list of URLs"}), 400
+
+        # Download and extract text from each document
+        all_texts = []
+        for url in doc_urls:
+            try:
+                resp = requests.get(url, timeout=15)
+                resp.raise_for_status()
+                content_type = resp.headers.get('Content-Type', '').lower()
+                if '.pdf' in url.lower() or 'pdf' in content_type:
+                    with tempfile.NamedTemporaryFile(suffix='.pdf') as tmp:
+                        tmp.write(resp.content)
+                        tmp.flush()
+                        reader = PdfReader(tmp.name)
+                        text = "\n".join(page.extract_text() or '' for page in reader.pages)
+                        all_texts.append(text)
+                elif '.docx' in url.lower() or 'word' in content_type or 'docx' in content_type:
+                    with tempfile.NamedTemporaryFile(suffix='.docx') as tmp:
+                        tmp.write(resp.content)
+                        tmp.flush()
+                        doc = docx.Document(tmp.name)
+                        text = "\n".join([p.text for p in doc.paragraphs])
+                        all_texts.append(text)
+                else:
+                    # Fallback: treat as plain text
+                    all_texts.append(resp.text)
+            except Exception as e:
+                print(f"Error downloading or processing {url}: {e}")
+                continue
+        if not all_texts:
+            return jsonify({"error": "No valid documents could be processed."}), 400
+
+        # Combine all texts for chunking
+        combined_text = "\n\n".join(all_texts)
+        # Use the improved section/paragraph-based chunking
+        from utils.query_expander import QueryExpander  # for llm if needed
+        processor = ClauseRetriever(None)  # We'll use a local embedding function
+        # Use the same chunking logic as ingest.py
+        def semantic_chunking(text):
+            paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 0]
+            chunks = []
+            for para in paragraphs:
+                if len(para.split()) < MIN_CHUNK_LENGTH:
+                    continue
+                if len(para.split()) > CHUNK_SIZE:
+                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                    current_chunk = []
+                    current_len = 0
+                    for sent in sentences:
+                        sent_len = len(sent.split())
+                        if current_len + sent_len > CHUNK_SIZE and current_chunk:
+                            chunk_text = ' '.join(current_chunk)
+                            chunks.append({'text': chunk_text})
+                            current_chunk = []
+                            current_len = 0
+                        current_chunk.append(sent)
+                        current_len += sent_len
+                    if current_chunk:
+                        chunk_text = ' '.join(current_chunk)
+                        chunks.append({'text': chunk_text})
+                else:
+                    chunks.append({'text': para})
+            return chunks
+
+        # Chunk the combined text
+        chunks = semantic_chunking(combined_text)
+        if not chunks:
+            return jsonify({"error": "No valid text chunks found in documents."}), 400
+
+        # Embed the chunks using the same embedding model as before
+        from chromadb.utils import embedding_functions
+        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=str(EMBEDDING_MODEL)
+        )
+        chunk_texts = [c['text'] for c in chunks]
+        chunk_embeddings = embedding_fn(chunk_texts)
+
+        # Embed the question
+        question_embedding = embedding_fn([question])[0]
+
+        # Compute cosine similarity and get top N chunks
+        import numpy as np
+        def cosine_sim(a, b):
+            a = np.array(a)
+            b = np.array(b)
+            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+        scored_chunks = []
+        for i, emb in enumerate(chunk_embeddings):
+            score = cosine_sim(question_embedding, emb)
+            scored_chunks.append({'text': chunk_texts[i], 'relevance_score': score})
+        # Sort and take top 20 for filtering
+        top_chunks = sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:20]
+
+        # Enhanced aggressive keyword filtering to capture ALL relevant terms
+        # Extract ALL meaningful words from the question
+        question_lower = question.lower()
+        question_words = [word.strip('.,?!()[]{}"') for word in question_lower.split() if len(word.strip('.,?!()[]{}"')) > 2]
+        
+        # Specific term extraction based on question content
+        question_keywords = []
+        if 'parent' in question_lower:
+            question_keywords.extend(['parent', 'parents', 'dependent', 'dependents', 'family'])
+        if 'child' in question_lower:
+            question_keywords.extend(['child', 'children', 'dependent', 'dependents'])
+        if 'spouse' in question_lower:
+            question_keywords.extend(['spouse', 'husband', 'wife', 'dependent', 'dependents'])
+        if 'grace' in question_lower or 'period' in question_lower:
+            question_keywords.extend(['grace', 'period', 'grace period', 'thirty', '30', 'days', 'payment', 'premium', 'due', 'renewal'])
+        if 'premium' in question_lower:
+            question_keywords.extend(['premium', 'payment', 'due', 'grace', 'renewal', 'continue', 'continuity'])
+        if 'waiting' in question_lower:
+            question_keywords.extend(['waiting', 'period', 'exclusion', 'months', 'days'])
+        if 'coverage' in question_lower or 'covered' in question_lower:
+            question_keywords.extend(['coverage', 'covered', 'benefit', 'include', 'exclude'])
+        
+        # General insurance keywords (comprehensive list)
+        general_keywords = [
+            "cover", "covered", "not covered", "included", "excluded", "benefit", "payable", 
+            "eligible", "allowed", "not allowed", "waiting period", "limit", "sum insured", 
+            "definition", "means", "shall mean", "grace", "period", "premium", "payment", 
+            "due", "renewal", "continue", "continuity", "thirty", "days", "months", "years"
+        ]
+        
+        # Combine ALL keywords: question words + specific terms + general terms
+        all_keywords = list(set(question_words + question_keywords + general_keywords))
+        print(f"\n=== KEYWORD MATCHING DEBUG ===")
+        print(f"Question: {question}")
+        print(f"Question keywords: {question_keywords}")
+        print(f"All keywords: {all_keywords}")
+        
+        keyword_chunks = []
+        for c in top_chunks:
+            matched_keywords = [kw for kw in all_keywords if kw in c['text'].lower()]
+            if matched_keywords:
+                c['matched_keywords'] = matched_keywords
+                keyword_chunks.append(c)
+                print(f"Chunk matched keywords: {matched_keywords}")
+                print(f"Chunk text: {c['text'][:150]}...")
+        
+        print(f"Found {len(keyword_chunks)} keyword-rich chunks out of {len(top_chunks)} total")
+        print("=== END KEYWORD DEBUG ===")
+        
+        # Improved fallback logic - always ensure we have good chunks
+        if keyword_chunks and len(keyword_chunks) >= 5:
+            # Use keyword-rich chunks if we have enough
+            filtered_chunks = keyword_chunks[:12]
+            print(f"Using {len(filtered_chunks)} keyword-rich chunks")
+        elif keyword_chunks:
+            # Mix keyword chunks with top chunks for better coverage
+            filtered_chunks = keyword_chunks + [c for c in top_chunks if c not in keyword_chunks]
+            filtered_chunks = filtered_chunks[:12]
+            print(f"Using mixed chunks: {len(keyword_chunks)} keyword + {len(filtered_chunks) - len(keyword_chunks)} top chunks")
+        else:
+            # Fallback to top chunks but take more for better coverage
+            filtered_chunks = top_chunks[:15]  # Increased from 8 to 15
+            print(f"Using fallback: {len(filtered_chunks)} top chunks without keyword filtering")
+
+        # Optimize chunks for better context while maintaining latency (increased from 400 to 800 chars)
+        optimized_clauses = []
+        current_tokens = 0
+        for clause in filtered_chunks:
+            # Preserve more context - 800 chars instead of 400
+            short_text = clause['text'][:800] + ("..." if len(clause['text']) > 800 else "")
+            tokens = len(short_text) // 4
+            if current_tokens + tokens > 400:  # Increased token limit
+                break
+            # Try to preserve section metadata if available
+            section_info = 'Unknown'
+            if hasattr(clause, 'metadata') and clause.metadata:
+                section_info = clause.metadata.get('section_headers', 'Unknown')
+            elif 'metadata' in clause:
+                section_info = clause['metadata'].get('section_headers', 'Unknown')
+            
+            optimized_clauses.append({
+                'text': short_text, 
+                'metadata': {'section_headers': section_info}
+            })
+            current_tokens += tokens
+
+        # Print evidence chunks for debugging
+        print("---- Evidence Chunks ----")
+        for i, e in enumerate(optimized_clauses):
+            print(f"Chunk {i+1}: {e['text'][:300]}")
+            print(f"Section: {e['metadata'].get('section_headers', 'Unknown')}")
+            print("------------------------")
+
+        # Add debugging to see what evidence is being provided
+        print(f"\n=== DEBUGGING QUESTION: {question} ===")
+        print(f"Number of evidence chunks: {len(optimized_clauses)}")
+        for i, clause in enumerate(optimized_clauses):
+            print(f"Evidence {i+1}: {clause['text'][:200]}...")
+        print("=== END DEBUGGING ===")
+        
+        # Use the improved balanced prompt that doesn't bias towards "No"
+        concise_prompt = f'''You are an expert insurance policy analyst. Analyze the policy clauses carefully and answer the user's question accurately.
+
+IMPORTANT INSTRUCTIONS:
+- Carefully read ALL policy clauses provided before answering
+- Look for ANY mention of coverage, benefits, or definitions related to the question
+- Start with "Yes," if coverage exists OR "No," if explicitly excluded
+- Include specific conditions, limits, waiting periods, and requirements when coverage exists
+- Always mention the relevant policy section/clause reference (e.g., "Section C, Part A.9")
+- Be definitive and direct - avoid phrases like "it appears", "seems to", "may be", "possibly"
+- If coverage exists: "Yes, [item] is covered [conditions/limits], [requirements]. (Section reference)"
+- If explicitly excluded: "No, [item] is excluded [reason]. (Section reference)"
+- Maximum 2 lines, be comprehensive but concise
+- Only use "Coverage is not mentioned in the policy" if absolutely no relevant information exists
+- IMPORTANT: Look for coverage in definitions, benefits, dependents sections - not just exclusions
+
+User Query: "{question}"
+
+Policy Clauses:
+{json.dumps([{"text": c['text'], "section": c['metadata'].get('section_headers', 'Unknown')} for c in optimized_clauses], indent=2)}
+
+Detailed Answer:'''
+
+        concise_answer = None
+        model_used = None
+        try:
+            concise_answer = gemini_generate(concise_prompt, max_tokens=120, temperature=0.1)
+            if (not concise_answer or 'error' in concise_answer.lower() or 'timed out' in concise_answer.lower()):
+                raise Exception('Gemini failed')
+            model_used = "gemini"
+        except Exception as e:
+            print(f"Gemini error: {str(e)}")
+            try:
+                response = co.generate(
+                    model='command-r-plus',
+                    prompt=concise_prompt,
+                    max_tokens=120,
+                    temperature=0.1
+                )
+                concise_answer = response.generations[0].text.strip()
+                if not concise_answer:
+                    raise Exception('Cohere failed')
+                model_used = "cohere"
+            except Exception as e:
+                print(f"Cohere error: {str(e)}")
+                concise_answer = "No relevant information found."
+                model_used = "none"
+
+        # Clean answer but preserve multi-line format for descriptive answers
+        concise_answer = concise_answer.strip()
+        
+        # Only do minimal post-processing if the answer doesn't start correctly
+        if concise_answer and not concise_answer.startswith(('Yes,', 'No,', 'Coverage is not')):
+            # Check if it's a clear positive or negative answer and only then modify
+            answer_lower = concise_answer.lower()
+            if answer_lower.startswith('yes') and not concise_answer.startswith('Yes,'):
+                concise_answer = f"Yes, {concise_answer[3:].lstrip(',').strip()}"
+            elif answer_lower.startswith('no') and not concise_answer.startswith('No,'):
+                concise_answer = f"No, {concise_answer[2:].lstrip(',').strip()}"
+            elif 'not mentioned' in answer_lower or 'no information' in answer_lower:
+                concise_answer = "Coverage is not mentioned in the policy."
+            # Remove the aggressive defaulting that was causing incorrect "No" answers
+        
+        # Ensure answer is concise (max 2 lines)
+        lines = concise_answer.split('\n')
+        if len(lines) > 2:
+            concise_answer = '\n'.join(lines[:2])
+        # Also limit to reasonable word count (max 50 words for 2 lines)
+        words = concise_answer.split()
+        if len(words) > 50:
+            concise_answer = ' '.join(words[:50])
+
+        response_data = {
+            "answer": concise_answer,
+            "model_used": model_used,
+            "response_time_ms": tracker.get_response_time_ms()
+        }
+        return jsonify(response_data)
+    except Exception as e:
+        import traceback
+        error_msg = f"Unexpected error in /hackrx/run: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return jsonify({"error": error_msg, "response_time_ms": tracker.get_response_time_ms()}), 500
 
 if __name__ == '__main__':
     # Simple server run without debug
