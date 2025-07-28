@@ -470,7 +470,7 @@ def handle_query():
             expanded_queries = [question]
         
         # Enhanced clause retrieval
-        clauses_data = clause_retriever.get_relevant_clauses(question, n_results=3)
+        clauses_data = clause_retriever.get_relevant_clauses(question, n_results=8)
         
         if not clauses_data:
             concise_answer = "No relevant information found."
@@ -478,10 +478,19 @@ def handle_query():
             evidence = []
         else:
             # Optimize tokens for LLM
-            optimized_clauses = token_optimizer.truncate_clauses_aggressively(clauses_data)
+            # Aggressively truncate each clause to 400 chars for latency
+            optimized_clauses = []
+            current_tokens = 0
+            for clause in clauses_data:
+                short_text = clause['text'][:400] + ("..." if len(clause['text']) > 400 else "")
+                tokens = len(short_text) // 4
+                if current_tokens + tokens > 250:
+                    break
+                optimized_clauses.append({**clause, 'text': short_text})
+                current_tokens += tokens
             
             # Generate answer with enhanced prompt
-            concise_prompt = f'''You are an expert insurance policy analyst. Given the following user query and relevant policy clauses, answer concisely in one sentence. If not covered, say so. Reference clause numbers if possible.
+            concise_prompt = f'''You are an expert insurance policy analyst. Given the following user query and relevant policy clauses, answer in a single line starting with 'Yes,' or 'No,' as appropriate, followed by a brief reason or key detail (such as coverage amount, waiting period, or main condition). If the information is not present, reply: 'Coverage for [topic] is not specified in the policy.' Do not use hedging language. Be concise and specific.
 
 User Query: "{question}"
 
@@ -523,6 +532,11 @@ Answer:'''
             
             # Format evidence
             evidence = [response_formatter.format_clause_evidence(c) for c in clauses_data]
+            print("---- Evidence Chunks ----")
+            for i, e in enumerate(evidence):
+                print(f"Chunk {i+1}: {e['text'][:300]}")
+                print(f"Section: {e['clause']}, Document: {e['document']}")
+                print("------------------------")
         
         # Clean up answer
         concise_answer = concise_answer.strip().replace('\n', ' ')

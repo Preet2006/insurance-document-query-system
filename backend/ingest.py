@@ -164,42 +164,50 @@ Text: {text[:1000]}"""
             return ''
 
     def semantic_chunking(self, text: str) -> List[Dict[str, any]]:
-        """Enhanced semantic chunking with quality scoring"""
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+        """Section/paragraph-based chunking with quality scoring"""
+        # Split by double newlines (paragraphs)
+        paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 0]
         chunks = []
-        current_chunk = []
-        current_len = 0
-        
-        for sent in sentences:
-            sent_len = len(sent.split())
-            if current_len + sent_len > CHUNK_SIZE and current_chunk:
-                chunk_text = ' '.join(current_chunk)
-                quality_score = self._calculate_chunk_quality(chunk_text)
-                
+        for para in paragraphs:
+            if len(para.split()) < MIN_CHUNK_LENGTH:
+                continue
+            # If paragraph is too long, split further by sentences
+            if len(para.split()) > CHUNK_SIZE:
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                current_chunk = []
+                current_len = 0
+                for sent in sentences:
+                    sent_len = len(sent.split())
+                    if current_len + sent_len > CHUNK_SIZE and current_chunk:
+                        chunk_text = ' '.join(current_chunk)
+                        quality_score = self._calculate_chunk_quality(chunk_text)
+                        chunks.append({
+                            'text': chunk_text,
+                            'quality_score': quality_score,
+                            'word_count': len(chunk_text.split()),
+                            'sentences': len(current_chunk)
+                        })
+                        current_chunk = []
+                        current_len = 0
+                    current_chunk.append(sent)
+                    current_len += sent_len
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    quality_score = self._calculate_chunk_quality(chunk_text)
+                    chunks.append({
+                        'text': chunk_text,
+                        'quality_score': quality_score,
+                        'word_count': len(chunk_text.split()),
+                        'sentences': len(current_chunk)
+                    })
+            else:
+                quality_score = self._calculate_chunk_quality(para)
                 chunks.append({
-                    'text': chunk_text,
+                    'text': para,
                     'quality_score': quality_score,
-                    'word_count': len(chunk_text.split()),
-                    'sentences': len(current_chunk)
+                    'word_count': len(para.split()),
+                    'sentences': para.count('.') + para.count('!') + para.count('?')
                 })
-                
-                # Keep overlap for context
-                current_chunk = current_chunk[-CHUNK_OVERLAP:]
-                current_len = sum(len(s.split()) for s in current_chunk)
-            
-            current_chunk.append(sent)
-            current_len += sent_len
-        
-        if current_chunk:
-            chunk_text = ' '.join(current_chunk)
-            quality_score = self._calculate_chunk_quality(chunk_text)
-            chunks.append({
-                'text': chunk_text,
-                'quality_score': quality_score,
-                'word_count': len(chunk_text.split()),
-                'sentences': len(current_chunk)
-            })
-        
         # Filter by quality and minimum length
         return [chunk for chunk in chunks 
                 if chunk['word_count'] >= MIN_CHUNK_LENGTH 

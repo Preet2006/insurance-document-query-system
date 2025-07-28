@@ -16,7 +16,7 @@ CHROMA_DIR = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "insurance_policies_enhanced"
 
 # Processing Config - Enhanced for better accuracy
-CHUNK_SIZE = 512
+CHUNK_SIZE = 1200  # Increased from 512 for better context
 CHUNK_OVERLAP = 128
 MIN_CHUNK_LENGTH = 50
 
