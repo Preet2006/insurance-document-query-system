@@ -100,14 +100,16 @@ def parse_document_from_url(url):
             # --- Smart chunking: by paragraphs/sections, not by page ---
             chunks = []
             # If document is small, use as one chunk
-            if len(full_text.split()) < 4000:
+            if len(full_text.split()) < 2000:  # Reduced from 4000
                 add_chunk(chunks, full_text, section='Full PDF', chunk_type='pdf_full')
             else:
                 # Split by double newlines or headings
                 paras = re.split(r'\n\s*\n', full_text)
+                chunk_count = 0
                 for para in paras:
-                    if len(para.split()) > 20:
+                    if len(para.split()) > 15 and chunk_count < 30:  # Reduced from 20, added limit
                         add_chunk(chunks, para, section='PDF Section', chunk_type='pdf_section')
+                        chunk_count += 1
             return [c for c in chunks if c['text']]
         except Exception as e:
             logger.error(f"PDF parsing failed: {e}\n{traceback.format_exc()}")
@@ -815,10 +817,12 @@ def hackrx_run():
             return jsonify({"error": f"Failed to download or process document: {e}"}), 400
         if not chunks:
             return jsonify({"error": "No valid text chunks found in document"}), 400
-        chunk_texts = [c['text'] for c in chunks]
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=str(EMBEDDING_MODEL)
-        )
+        # Limit chunks to reduce memory usage
+        max_chunks = 20  # Reduced from unlimited
+        chunk_texts = [c['text'] for c in chunks[:max_chunks]]
+        
+        # Use singleton embedding function
+        embedding_fn = get_embedding_function()
         chunk_embeddings = embedding_fn(chunk_texts)
         answers = []
         for i, question in enumerate(questions):
@@ -838,7 +842,7 @@ def hackrx_run():
                     'section': chunks[j].get('section', ''),
                     'type': chunks[j].get('type', '')
                 })
-            top_chunks = sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:10]
+            top_chunks = sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:5]  # Reduced from 10
             question_lower = question.lower()
             question_words = [word.strip('.,?!()[]{}"') for word in question_lower.split() if len(word.strip('.,?!()[]{}"')) > 2]
             insurance_keywords = []
@@ -873,12 +877,12 @@ def hackrx_run():
                 if matched_keywords:
                     chunk['matched_keywords'] = matched_keywords
                     keyword_chunks.append(chunk)
-            if keyword_chunks and len(keyword_chunks) >= 3:
-                filtered_chunks = keyword_chunks[:8]
+            if keyword_chunks and len(keyword_chunks) >= 2:  # Reduced from 3
+                filtered_chunks = keyword_chunks[:4]  # Reduced from 8
             else:
-                filtered_chunks = top_chunks[:8]
+                filtered_chunks = top_chunks[:4]  # Reduced from 8
             evidence_text = "\n\n".join([
-                f"Section {c.get('section','')}: {c['text'][:600]}..." for c in filtered_chunks
+                f"Section {c.get('section','')}: {c['text'][:300]}..." for c in filtered_chunks  # Reduced from 600
             ])
             prompt = f'''You are an expert insurance policy analyst. Answer the question based ONLY on the policy clauses provided below.\n\nIMPORTANT INSTRUCTIONS:\n- Read ALL policy clauses carefully before answering\n- Look for specific details, conditions, and requirements\n- Start with "Yes," if coverage exists OR "No," if explicitly excluded\n- Include specific amounts, time periods, conditions, and requirements\n- Be comprehensive but concise (maximum 2 lines)\n- Only say "The policy does not specify" if absolutely no relevant information exists\n- Reference specific policy sections when possible\n\nQuestion: "{question}"\n\nPolicy Clauses:\n{evidence_text}\n\nAnswer:'''
             answer = None
@@ -977,6 +981,18 @@ def semantic_chunking(text):
         chunks.append({'text': text.strip()})
     
     return chunks
+
+# Global embedding function to avoid reloading the model
+_embedding_fn = None
+
+def get_embedding_function():
+    """Get or create the embedding function singleton"""
+    global _embedding_fn
+    if _embedding_fn is None:
+        _embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=str(EMBEDDING_MODEL)
+        )
+    return _embedding_fn
 
 if __name__ == '__main__':
     # Get port from environment variable (for production) or use 5001
