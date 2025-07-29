@@ -63,8 +63,11 @@ def main():
     # Check API keys
     check_api_keys()
     
+    # Get port from environment variable (for production) or use 5001
+    port = int(os.environ.get('PORT', 5001))
+    
     print("\n📋 System Information:")
-    print(f"   - Server will run on: http://localhost:5001")
+    print(f"   - Server will run on: http://localhost:{port}")
     print(f"   - Hackathon endpoint: POST /hackrx/run")
     print(f"   - Health check: GET /health")
     
@@ -77,7 +80,7 @@ def main():
         import sys
         sys.path.insert(0, str(backend_path))
         from app import app
-        app.run(host='0.0.0.0', port=5001, debug=False)
+        app.run(host='0.0.0.0', port=port, debug=False)
     except KeyboardInterrupt:
         print("\n🛑 Server stopped by user")
     except Exception as e:
