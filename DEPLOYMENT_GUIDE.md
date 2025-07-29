@@ -45,7 +45,7 @@
    - **Name**: `insurance-document-query-system`
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r backend/requirements.txt`
-   - **Start Command**: `cd backend && python app.py`
+   - **Start Command**: `python start_server.py`
    - **Plan**: Free (or paid for better performance)
 
 4. **Set Environment Variables** (optional):

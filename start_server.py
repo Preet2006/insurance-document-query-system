@@ -74,6 +74,8 @@ def main():
     
     # Import and run the Flask app
     try:
+        import sys
+        sys.path.insert(0, str(backend_path))
         from app import app
         app.run(host='0.0.0.0', port=5001, debug=False)
     except KeyboardInterrupt:
