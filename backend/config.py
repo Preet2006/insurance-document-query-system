@@ -4,7 +4,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 
 # Model Config
-EMBEDDING_MODEL = BASE_DIR / "models/bge-small-en-v1.5"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"  # Use HuggingFace model that will be downloaded
 LLM_MODEL = BASE_DIR / "models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 
 # Gemini API Config

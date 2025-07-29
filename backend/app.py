@@ -25,13 +25,135 @@ from io import BytesIO
 import tempfile
 from PyPDF2 import PdfReader
 import docx
+import numpy as np
+import mimetypes
+import logging
+from email import policy
+from email.parser import BytesParser
+import base64
+import pdfplumber
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("doc_parser")
+
+def parse_document_from_url(url):
+    """
+    Download and parse a document from a URL (PDF, DOCX, EML, TXT).
+    Returns: list of dicts: [{text, section, table, type, ...}]
+    Raises: Exception with clear error message if parsing fails.
+    """
+    import requests
+    from io import BytesIO
+    import docx
+    from PyPDF2 import PdfReader
+    import traceback
+    import re
+    import os
+
+    logger.info(f"Downloading document: {url}")
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        content = resp.content
+        content_type = resp.headers.get('Content-Type', '').lower()
+        ext = os.path.splitext(url.split('?')[0])[1].lower()
+    except Exception as e:
+        logger.error(f"Failed to download document: {url} | {e}")
+        raise Exception(f"Failed to download document: {e}")
+
+    def add_chunk(chunks, text, section=None, table=None, chunk_type=None):
+        if text and text.strip():
+            chunks.append({
+                'text': text.strip(),
+                'section': section or '',
+                'table': table or '',
+                'type': chunk_type or ''
+            })
+
+    # --- Improved PDF logic ---
+    if ext == '.pdf' or 'pdf' in content_type:
+        try:
+            pdf_stream = BytesIO(content)
+            reader = PdfReader(pdf_stream)
+            all_text = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ''
+                all_text.append(text)
+            full_text = '\n'.join(all_text)
+            # If no text, fallback to pdfplumber
+            if not full_text.strip():
+                pdf_stream.seek(0)
+                with pdfplumber.open(pdf_stream) as pdf:
+                    all_text = [page.extract_text() or '' for page in pdf.pages]
+                full_text = '\n'.join(all_text)
+            # If still no text, fallback to OCR
+            if not full_text.strip():
+                try:
+                    from pdf2image import convert_from_bytes
+                    import pytesseract
+                    images = convert_from_bytes(content)
+                    all_text = [pytesseract.image_to_string(img) for img in images]
+                    full_text = '\n'.join(all_text)
+                except Exception as ocr_e:
+                    logger.error(f"PDF OCR failed: {ocr_e}")
+            # --- Smart chunking: by paragraphs/sections, not by page ---
+            chunks = []
+            # If document is small, use as one chunk
+            if len(full_text.split()) < 4000:
+                add_chunk(chunks, full_text, section='Full PDF', chunk_type='pdf_full')
+            else:
+                # Split by double newlines or headings
+                paras = re.split(r'\n\s*\n', full_text)
+                for para in paras:
+                    if len(para.split()) > 20:
+                        add_chunk(chunks, para, section='PDF Section', chunk_type='pdf_section')
+            return [c for c in chunks if c['text']]
+        except Exception as e:
+            logger.error(f"PDF parsing failed: {e}\n{traceback.format_exc()}")
+            # Fallback to plain text
+    # --- DOCX and EML logic unchanged ---
+    if ext == '.docx' or 'word' in content_type or 'docx' in content_type:
+        try:
+            docx_stream = BytesIO(content)
+            doc = docx.Document(docx_stream)
+            chunks = []
+            for para in doc.paragraphs:
+                add_chunk(chunks, para.text, section=para.style.name if para.style else None, chunk_type='docx_paragraph')
+            for t_idx, table in enumerate(doc.tables):
+                table_text = '\n'.join([' | '.join(cell.text.strip() for cell in row.cells) for row in table.rows])
+                add_chunk(chunks, table_text, section=f"Table {t_idx+1}", table=table_text, chunk_type='docx_table')
+            return [c for c in chunks if c['text']]
+        except Exception as e:
+            logger.error(f"DOCX parsing failed: {e}\n{traceback.format_exc()}")
+    if ext == '.eml' or 'message/rfc822' in content_type or 'eml' in content_type:
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(content)
+            text = ''
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        text += part.get_content() + '\n'
+            else:
+                text = msg.get_content()
+            add_chunk(chunks := [], text, section='email_body', chunk_type='eml')
+            return [c for c in chunks if c['text']]
+        except Exception as e:
+            logger.error(f"EML parsing failed: {e}\n{traceback.format_exc()}")
+    try:
+        text = content.decode(errors='ignore')
+        add_chunk(chunks := [], text, section='plain_text', chunk_type='plain')
+        return [c for c in chunks if c['text']]
+    except Exception as e:
+        logger.error(f"Plain text parsing failed: {e}\n{traceback.format_exc()}")
+        raise Exception("Document could not be parsed as PDF, DOCX, EML, or plain text.")
 
 app = Flask(__name__)
 CORS(app)
 
 # === COHERE API KEY SETUP ===
-# Paste your Cohere API key below (or load from environment/config securely)
-COHERE_API_KEY = "qZmghdKw7d7YxNryMj57OsMN0jLsQSCy0c7xulRA"
+# Load from environment variables for production
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "qZmghdKw7d7YxNryMj57OsMN0jLsQSCy0c7xulRA")
 co = cohere.Client(COHERE_API_KEY)
 
 def llm(prompt, max_tokens=512, temperature=0.2):
@@ -205,15 +327,22 @@ def truncate_clauses_to_fit(clauses, prompt_prefix, max_tokens=2048, buffer=200)
         current_tokens += clause_tokens
     return truncated_clauses
 
-# Initialize components
-client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-# NOTE: The following embedding_function type warning is a linter issue, not a runtime error for your use case.
-collection = client.get_collection(
-    name=COLLECTION_NAME,
-    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=str(EMBEDDING_MODEL)
-    )  # type: ignore
-)
+# Initialize components - only for legacy endpoints
+client = None
+collection = None
+
+# Only initialize ChromaDB if the collection exists (for legacy /query endpoint)
+try:
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    collection = client.get_collection(
+        name=COLLECTION_NAME,
+        embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=str(EMBEDDING_MODEL)
+        )  # type: ignore
+    )
+except Exception as e:
+    print(f"ChromaDB collection not found: {e}")
+    print("This is normal for the hackathon endpoint which processes documents at runtime")
 
 # Initialize our new components
 clause_retriever = ClauseRetriever(collection)
@@ -455,6 +584,10 @@ def handle_query():
         question = data.get('question', '').strip()
         if not question:
             return jsonify({"error": "No question provided"}), 400
+        
+        # Check if ChromaDB collection is available
+        if collection is None:
+            return jsonify({"error": "No pre-processed documents available. Use /hackrx/run endpoint for runtime document processing."}), 400
             
         cache_key = question.lower() + '_enhanced'
         cached = cache_get(cache_key)
@@ -653,303 +786,138 @@ def health_check():
         "cache_size": len(query_cache)
     })
 
+# --- Refactor /hackrx/run ---
 @app.route('/hackrx/run', methods=['POST'])
 def hackrx_run():
-    """
-    Accepts a JSON body with:
-    {
-        "question": "...",
-        "documents": ["url1", "url2", ...]
-    }
-    Downloads and processes the documents at runtime, then answers the question using the same logic as /query.
-    """
     tracker = PerformanceTracker()
     tracker.start()
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
-        question = data.get('question', '').strip()
-        doc_urls = data.get('documents', [])
-        if not question:
-            return jsonify({"error": "No question provided"}), 400
-        
-        # Handle both string and array formats for documents
-        if not doc_urls:
+        documents = data.get('documents', '')
+        questions = data.get('questions', [])
+        if not documents:
             return jsonify({"error": "No documents provided"}), 400
-        
-        # Convert string to list if needed
-        if isinstance(doc_urls, str):
-            doc_urls = [doc_urls]
-        elif not isinstance(doc_urls, list):
-            return jsonify({"error": "Documents should be a string URL or list of URLs"}), 400
-
-        # Download and extract text from each document
-        all_texts = []
-        for url in doc_urls:
-            try:
-                resp = requests.get(url, timeout=15)
-                resp.raise_for_status()
-                content_type = resp.headers.get('Content-Type', '').lower()
-                if '.pdf' in url.lower() or 'pdf' in content_type:
-                    with tempfile.NamedTemporaryFile(suffix='.pdf') as tmp:
-                        tmp.write(resp.content)
-                        tmp.flush()
-                        reader = PdfReader(tmp.name)
-                        text = "\n".join(page.extract_text() or '' for page in reader.pages)
-                        all_texts.append(text)
-                elif '.docx' in url.lower() or 'word' in content_type or 'docx' in content_type:
-                    with tempfile.NamedTemporaryFile(suffix='.docx') as tmp:
-                        tmp.write(resp.content)
-                        tmp.flush()
-                        doc = docx.Document(tmp.name)
-                        text = "\n".join([p.text for p in doc.paragraphs])
-                        all_texts.append(text)
-                else:
-                    # Fallback: treat as plain text
-                    all_texts.append(resp.text)
-            except Exception as e:
-                print(f"Error downloading or processing {url}: {e}")
-                continue
-        if not all_texts:
-            return jsonify({"error": "No valid documents could be processed."}), 400
-
-        # Combine all texts for chunking
-        combined_text = "\n\n".join(all_texts)
-        # Use the improved section/paragraph-based chunking
-        from utils.query_expander import QueryExpander  # for llm if needed
-        processor = ClauseRetriever(None)  # We'll use a local embedding function
-        # Use the same chunking logic as ingest.py
-        def semantic_chunking(text):
-            paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 0]
-            chunks = []
-            for para in paragraphs:
-                if len(para.split()) < MIN_CHUNK_LENGTH:
-                    continue
-                if len(para.split()) > CHUNK_SIZE:
-                    sentences = re.split(r'(?<=[.!?])\s+', para)
-                    current_chunk = []
-                    current_len = 0
-                    for sent in sentences:
-                        sent_len = len(sent.split())
-                        if current_len + sent_len > CHUNK_SIZE and current_chunk:
-                            chunk_text = ' '.join(current_chunk)
-                            chunks.append({'text': chunk_text})
-                            current_chunk = []
-                            current_len = 0
-                        current_chunk.append(sent)
-                        current_len += sent_len
-                    if current_chunk:
-                        chunk_text = ' '.join(current_chunk)
-                        chunks.append({'text': chunk_text})
-                else:
-                    chunks.append({'text': para})
-            return chunks
-
-        # Chunk the combined text
-        chunks = semantic_chunking(combined_text)
+        # --- Robust question handling ---
+        if isinstance(questions, str):
+            questions = [questions]
+        elif not isinstance(questions, list):
+            return jsonify({"error": "Questions must be a string or a non-empty array"}), 400
+        if not questions or not all(isinstance(q, str) and q.strip() for q in questions):
+            return jsonify({"error": "Questions must be a non-empty string or array of non-empty strings"}), 400
+        print(f"Processing {len(questions)} questions for document: {documents}")
+        # --- Use new robust parser ---
+        try:
+            chunks = parse_document_from_url(documents)
+        except Exception as e:
+            logger.error(f"Document parsing failed: {e}")
+            return jsonify({"error": f"Failed to download or process document: {e}"}), 400
         if not chunks:
-            return jsonify({"error": "No valid text chunks found in documents."}), 400
-
-        # Embed the chunks using the same embedding model as before
-        from chromadb.utils import embedding_functions
+            return jsonify({"error": "No valid text chunks found in document"}), 400
+        chunk_texts = [c['text'] for c in chunks]
         embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=str(EMBEDDING_MODEL)
         )
-        chunk_texts = [c['text'] for c in chunks]
         chunk_embeddings = embedding_fn(chunk_texts)
-
-        # Embed the question
-        question_embedding = embedding_fn([question])[0]
-
-        # Compute cosine similarity and get top N chunks
-        import numpy as np
-        def cosine_sim(a, b):
-            a = np.array(a)
-            b = np.array(b)
-            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
-        scored_chunks = []
-        for i, emb in enumerate(chunk_embeddings):
-            score = cosine_sim(question_embedding, emb)
-            scored_chunks.append({'text': chunk_texts[i], 'relevance_score': score})
-        # Sort and take top 20 for filtering
-        top_chunks = sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:20]
-
-        # Enhanced aggressive keyword filtering to capture ALL relevant terms
-        # Extract ALL meaningful words from the question
-        question_lower = question.lower()
-        question_words = [word.strip('.,?!()[]{}"') for word in question_lower.split() if len(word.strip('.,?!()[]{}"')) > 2]
-        
-        # Specific term extraction based on question content
-        question_keywords = []
-        if 'parent' in question_lower:
-            question_keywords.extend(['parent', 'parents', 'dependent', 'dependents', 'family'])
-        if 'child' in question_lower:
-            question_keywords.extend(['child', 'children', 'dependent', 'dependents'])
-        if 'spouse' in question_lower:
-            question_keywords.extend(['spouse', 'husband', 'wife', 'dependent', 'dependents'])
-        if 'grace' in question_lower or 'period' in question_lower:
-            question_keywords.extend(['grace', 'period', 'grace period', 'thirty', '30', 'days', 'payment', 'premium', 'due', 'renewal'])
-        if 'premium' in question_lower:
-            question_keywords.extend(['premium', 'payment', 'due', 'grace', 'renewal', 'continue', 'continuity'])
-        if 'waiting' in question_lower:
-            question_keywords.extend(['waiting', 'period', 'exclusion', 'months', 'days'])
-        if 'coverage' in question_lower or 'covered' in question_lower:
-            question_keywords.extend(['coverage', 'covered', 'benefit', 'include', 'exclude'])
-        
-        # General insurance keywords (comprehensive list)
-        general_keywords = [
-            "cover", "covered", "not covered", "included", "excluded", "benefit", "payable", 
-            "eligible", "allowed", "not allowed", "waiting period", "limit", "sum insured", 
-            "definition", "means", "shall mean", "grace", "period", "premium", "payment", 
-            "due", "renewal", "continue", "continuity", "thirty", "days", "months", "years"
-        ]
-        
-        # Combine ALL keywords: question words + specific terms + general terms
-        all_keywords = list(set(question_words + question_keywords + general_keywords))
-        print(f"\n=== KEYWORD MATCHING DEBUG ===")
-        print(f"Question: {question}")
-        print(f"Question keywords: {question_keywords}")
-        print(f"All keywords: {all_keywords}")
-        
-        keyword_chunks = []
-        for c in top_chunks:
-            matched_keywords = [kw for kw in all_keywords if kw in c['text'].lower()]
-            if matched_keywords:
-                c['matched_keywords'] = matched_keywords
-                keyword_chunks.append(c)
-                print(f"Chunk matched keywords: {matched_keywords}")
-                print(f"Chunk text: {c['text'][:150]}...")
-        
-        print(f"Found {len(keyword_chunks)} keyword-rich chunks out of {len(top_chunks)} total")
-        print("=== END KEYWORD DEBUG ===")
-        
-        # Improved fallback logic - always ensure we have good chunks
-        if keyword_chunks and len(keyword_chunks) >= 5:
-            # Use keyword-rich chunks if we have enough
-            filtered_chunks = keyword_chunks[:12]
-            print(f"Using {len(filtered_chunks)} keyword-rich chunks")
-        elif keyword_chunks:
-            # Mix keyword chunks with top chunks for better coverage
-            filtered_chunks = keyword_chunks + [c for c in top_chunks if c not in keyword_chunks]
-            filtered_chunks = filtered_chunks[:12]
-            print(f"Using mixed chunks: {len(keyword_chunks)} keyword + {len(filtered_chunks) - len(keyword_chunks)} top chunks")
-        else:
-            # Fallback to top chunks but take more for better coverage
-            filtered_chunks = top_chunks[:15]  # Increased from 8 to 15
-            print(f"Using fallback: {len(filtered_chunks)} top chunks without keyword filtering")
-
-        # Optimize chunks for better context while maintaining latency (increased from 400 to 800 chars)
-        optimized_clauses = []
-        current_tokens = 0
-        for clause in filtered_chunks:
-            # Preserve more context - 800 chars instead of 400
-            short_text = clause['text'][:800] + ("..." if len(clause['text']) > 800 else "")
-            tokens = len(short_text) // 4
-            if current_tokens + tokens > 400:  # Increased token limit
-                break
-            # Try to preserve section metadata if available
-            section_info = 'Unknown'
-            if hasattr(clause, 'metadata') and clause.metadata:
-                section_info = clause.metadata.get('section_headers', 'Unknown')
-            elif 'metadata' in clause:
-                section_info = clause['metadata'].get('section_headers', 'Unknown')
-            
-            optimized_clauses.append({
-                'text': short_text, 
-                'metadata': {'section_headers': section_info}
-            })
-            current_tokens += tokens
-
-        # Print evidence chunks for debugging
-        print("---- Evidence Chunks ----")
-        for i, e in enumerate(optimized_clauses):
-            print(f"Chunk {i+1}: {e['text'][:300]}")
-            print(f"Section: {e['metadata'].get('section_headers', 'Unknown')}")
-            print("------------------------")
-
-        # Add debugging to see what evidence is being provided
-        print(f"\n=== DEBUGGING QUESTION: {question} ===")
-        print(f"Number of evidence chunks: {len(optimized_clauses)}")
-        for i, clause in enumerate(optimized_clauses):
-            print(f"Evidence {i+1}: {clause['text'][:200]}...")
-        print("=== END DEBUGGING ===")
-        
-        # Use the improved balanced prompt that doesn't bias towards "No"
-        concise_prompt = f'''You are an expert insurance policy analyst. Analyze the policy clauses carefully and answer the user's question accurately.
-
-IMPORTANT INSTRUCTIONS:
-- Carefully read ALL policy clauses provided before answering
-- Look for ANY mention of coverage, benefits, or definitions related to the question
-- Start with "Yes," if coverage exists OR "No," if explicitly excluded
-- Include specific conditions, limits, waiting periods, and requirements when coverage exists
-- Always mention the relevant policy section/clause reference (e.g., "Section C, Part A.9")
-- Be definitive and direct - avoid phrases like "it appears", "seems to", "may be", "possibly"
-- If coverage exists: "Yes, [item] is covered [conditions/limits], [requirements]. (Section reference)"
-- If explicitly excluded: "No, [item] is excluded [reason]. (Section reference)"
-- Maximum 2 lines, be comprehensive but concise
-- Only use "Coverage is not mentioned in the policy" if absolutely no relevant information exists
-- IMPORTANT: Look for coverage in definitions, benefits, dependents sections - not just exclusions
-
-User Query: "{question}"
-
-Policy Clauses:
-{json.dumps([{"text": c['text'], "section": c['metadata'].get('section_headers', 'Unknown')} for c in optimized_clauses], indent=2)}
-
-Detailed Answer:'''
-
-        concise_answer = None
-        model_used = None
-        try:
-            concise_answer = gemini_generate(concise_prompt, max_tokens=120, temperature=0.1)
-            if (not concise_answer or 'error' in concise_answer.lower() or 'timed out' in concise_answer.lower()):
-                raise Exception('Gemini failed')
-            model_used = "gemini"
-        except Exception as e:
-            print(f"Gemini error: {str(e)}")
+        answers = []
+        for i, question in enumerate(questions):
+            print(f"Processing question {i+1}/{len(questions)}: {question}")
+            question_embedding = embedding_fn([question])[0]
+            import numpy as np
+            def cosine_sim(a, b):
+                a = np.array(a)
+                b = np.array(b)
+                return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+            scored_chunks = []
+            for j, emb in enumerate(chunk_embeddings):
+                score = cosine_sim(question_embedding, emb)
+                scored_chunks.append({
+                    'text': chunk_texts[j],
+                    'relevance_score': score,
+                    'section': chunks[j].get('section', ''),
+                    'type': chunks[j].get('type', '')
+                })
+            top_chunks = sorted(scored_chunks, key=lambda x: x['relevance_score'], reverse=True)[:10]
+            question_lower = question.lower()
+            question_words = [word.strip('.,?!()[]{}"') for word in question_lower.split() if len(word.strip('.,?!()[]{}"')) > 2]
+            insurance_keywords = []
+            if 'grace' in question_lower or 'period' in question_lower:
+                insurance_keywords.extend(['grace', 'period', 'grace period', 'thirty', '30', 'days', 'payment', 'premium', 'due', 'renewal'])
+            if 'premium' in question_lower:
+                insurance_keywords.extend(['premium', 'payment', 'due', 'grace', 'renewal', 'continue', 'continuity'])
+            if 'waiting' in question_lower:
+                insurance_keywords.extend(['waiting', 'period', 'exclusion', 'months', 'days'])
+            if 'coverage' in question_lower or 'covered' in question_lower:
+                insurance_keywords.extend(['coverage', 'covered', 'benefit', 'include', 'exclude'])
+            if 'maternity' in question_lower:
+                insurance_keywords.extend(['maternity', 'pregnancy', 'childbirth', 'delivery', 'termination'])
+            if 'cataract' in question_lower:
+                insurance_keywords.extend(['cataract', 'surgery', 'eye', 'ophthalmic'])
+            if 'organ' in question_lower or 'donor' in question_lower:
+                insurance_keywords.extend(['organ', 'donor', 'transplantation', 'harvesting'])
+            if 'discount' in question_lower or 'ncd' in question_lower:
+                insurance_keywords.extend(['discount', 'ncd', 'no claim', 'renewal'])
+            if 'check' in question_lower or 'preventive' in question_lower:
+                insurance_keywords.extend(['check', 'preventive', 'health', 'examination'])
+            if 'hospital' in question_lower:
+                insurance_keywords.extend(['hospital', 'institution', 'beds', 'nursing', 'operation'])
+            if 'ayush' in question_lower:
+                insurance_keywords.extend(['ayush', 'ayurveda', 'yoga', 'naturopathy', 'unani', 'siddha', 'homeopathy'])
+            if 'room' in question_lower or 'icu' in question_lower:
+                insurance_keywords.extend(['room', 'icu', 'rent', 'charges', 'limit'])
+            all_keywords = list(set(question_words + insurance_keywords))
+            keyword_chunks = []
+            for chunk in top_chunks:
+                matched_keywords = [kw for kw in all_keywords if kw in chunk['text'].lower()]
+                if matched_keywords:
+                    chunk['matched_keywords'] = matched_keywords
+                    keyword_chunks.append(chunk)
+            if keyword_chunks and len(keyword_chunks) >= 3:
+                filtered_chunks = keyword_chunks[:8]
+            else:
+                filtered_chunks = top_chunks[:8]
+            evidence_text = "\n\n".join([
+                f"Section {c.get('section','')}: {c['text'][:600]}..." for c in filtered_chunks
+            ])
+            prompt = f'''You are an expert insurance policy analyst. Answer the question based ONLY on the policy clauses provided below.\n\nIMPORTANT INSTRUCTIONS:\n- Read ALL policy clauses carefully before answering\n- Look for specific details, conditions, and requirements\n- Start with "Yes," if coverage exists OR "No," if explicitly excluded\n- Include specific amounts, time periods, conditions, and requirements\n- Be comprehensive but concise (maximum 2 lines)\n- Only say "The policy does not specify" if absolutely no relevant information exists\n- Reference specific policy sections when possible\n\nQuestion: "{question}"\n\nPolicy Clauses:\n{evidence_text}\n\nAnswer:'''
+            answer = None
             try:
-                response = co.generate(
-                    model='command-r-plus',
-                    prompt=concise_prompt,
-                    max_tokens=120,
-                    temperature=0.1
-                )
-                concise_answer = response.generations[0].text.strip()
-                if not concise_answer:
-                    raise Exception('Cohere failed')
-                model_used = "cohere"
+                answer = gemini_generate(prompt, max_tokens=150, temperature=0.1)
+                if not answer or 'error' in answer.lower() or 'timed out' in answer.lower():
+                    raise Exception('Gemini failed')
             except Exception as e:
-                print(f"Cohere error: {str(e)}")
-                concise_answer = "No relevant information found."
-                model_used = "none"
-
-        # Clean answer but preserve multi-line format for descriptive answers
-        concise_answer = concise_answer.strip()
-        
-        # Only do minimal post-processing if the answer doesn't start correctly
-        if concise_answer and not concise_answer.startswith(('Yes,', 'No,', 'Coverage is not')):
-            # Check if it's a clear positive or negative answer and only then modify
-            answer_lower = concise_answer.lower()
-            if answer_lower.startswith('yes') and not concise_answer.startswith('Yes,'):
-                concise_answer = f"Yes, {concise_answer[3:].lstrip(',').strip()}"
-            elif answer_lower.startswith('no') and not concise_answer.startswith('No,'):
-                concise_answer = f"No, {concise_answer[2:].lstrip(',').strip()}"
-            elif 'not mentioned' in answer_lower or 'no information' in answer_lower:
-                concise_answer = "Coverage is not mentioned in the policy."
-            # Remove the aggressive defaulting that was causing incorrect "No" answers
-        
-        # Ensure answer is concise (max 2 lines)
-        lines = concise_answer.split('\n')
-        if len(lines) > 2:
-            concise_answer = '\n'.join(lines[:2])
-        # Also limit to reasonable word count (max 50 words for 2 lines)
-        words = concise_answer.split()
-        if len(words) > 50:
-            concise_answer = ' '.join(words[:50])
-
+                print(f"Gemini error for question {i+1}: {str(e)}")
+                try:
+                    response = co.generate(
+                        model='command-r-plus',
+                        prompt=prompt,
+                        max_tokens=150,
+                        temperature=0.1
+                    )
+                    answer = response.generations[0].text.strip()
+                    if not answer:
+                        raise Exception('Cohere returned empty response')
+                except Exception as e:
+                    print(f"Cohere error for question {i+1}: {str(e)}")
+                    answer = "The policy does not specify this information."
+            if answer:
+                answer = answer.strip()
+                answer_lower = answer.lower()
+                if answer_lower.startswith('yes') and not answer.startswith('Yes,'):
+                    answer = f"Yes, {answer[3:].lstrip(',').strip()}"
+                elif answer_lower.startswith('no') and not answer.startswith('No,'):
+                    answer = f"No, {answer[2:].lstrip(',').strip()}"
+                lines = answer.split('\n')
+                if len(lines) > 2:
+                    answer = '\n'.join(lines[:2])
+                words = answer.split()
+                if len(words) > 50:
+                    answer = ' '.join(words[:50])
+            answers.append(answer)
+            print(f"Answer {i+1}: {answer}")
         response_data = {
-            "answer": concise_answer,
-            "model_used": model_used,
+            "answers": answers,
             "response_time_ms": tracker.get_response_time_ms()
         }
         return jsonify(response_data)
@@ -959,7 +927,60 @@ Detailed Answer:'''
         print(error_msg)
         return jsonify({"error": error_msg, "response_time_ms": tracker.get_response_time_ms()}), 500
 
+def semantic_chunking(text):
+    """Semantic chunking function for document processing"""
+    # Split by paragraphs first
+    paragraphs = [p.strip() for p in text.split('\n\n') if len(p.strip()) > 0]
+    chunks = []
+    
+    # If no paragraphs, split by sentences
+    if not paragraphs:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        paragraphs = [s.strip() for s in sentences if len(s.strip()) > 0]
+    
+    # If still no content, use the whole text as one chunk
+    if not paragraphs:
+        if len(text.strip()) > 0:
+            chunks.append({'text': text.strip()})
+        return chunks
+    
+    for para in paragraphs:
+        # Lower the minimum chunk length for small documents
+        min_length = min(MIN_CHUNK_LENGTH, 10)  # At least 10 words or config minimum
+        
+        if len(para.split()) < min_length:
+            continue
+        
+        if len(para.split()) > CHUNK_SIZE:  # Use config value
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+            current_chunk = []
+            current_len = 0
+            
+            for sent in sentences:
+                sent_len = len(sent.split())
+                if current_len + sent_len > CHUNK_SIZE and current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append({'text': chunk_text})
+                    current_chunk = []
+                    current_len = 0
+                current_chunk.append(sent)
+                current_len += sent_len
+            
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append({'text': chunk_text})
+        else:
+            chunks.append({'text': para})
+    
+    # If no chunks created, create at least one from the text
+    if not chunks and len(text.strip()) > 0:
+        chunks.append({'text': text.strip()})
+    
+    return chunks
+
 if __name__ == '__main__':
+    # Get port from environment variable (for production) or use 5001
+    port = int(os.environ.get('PORT', 5001))
     # Simple server run without debug
     # If you see Windows console errors, try running with: python -u backend/app.py
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)

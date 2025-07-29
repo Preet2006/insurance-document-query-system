@@ -19,12 +19,16 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# Virtual environments
+# Virtual Environment
 venv/
 env/
 ENV/
+
+# Environment Variables
+.env
+.env.local
+.env.production
 
 # IDE
 .vscode/
@@ -34,37 +38,26 @@ ENV/
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Logs
 *.log
 logs/
 
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Large model files (optional - you might want to include them)
-# *.gguf
-# *.bin
-# *.safetensors
-
 # Database
 *.db
-*.sqlite
 *.sqlite3
 
 # ChromaDB
-chroma_db/
+backend/chroma_db/
+
+# Models (if large)
+backend/models/
 
 # Temporary files
 *.tmp
-*.temp 
+*.temp
+
+# API Keys (backup)
+api_keys.txt
+secrets.txt 
