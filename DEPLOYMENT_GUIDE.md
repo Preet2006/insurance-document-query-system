@@ -48,12 +48,12 @@
    - **Start Command**: `cd backend && python app.py`
    - **Plan**: Free (or paid for better performance)
 
-4. **Set Environment Variables**:
+4. **Set Environment Variables** (optional):
    - Click "Environment" tab
    - Add these variables:
-     - `GEMINI_API_KEY`: Your Gemini API key (optional)
-     - `COHERE_API_KEY`: Your Cohere API key (optional)
+     - `GEMINI_API_KEY`: Your Gemini API key (optional - system has fallbacks)
      - `PYTHON_VERSION`: `3.10.0`
+   - **Note**: Cohere API key is already configured in the app
 
 5. **Deploy**:
    - Click "Create Web Service"
@@ -131,9 +131,9 @@ For the hackathon, you'll need to provide:
    - Ensure port is set correctly (Render auto-sets PORT env var)
 
 3. **API Keys Not Working**:
-   - Verify environment variables are set correctly
-   - Check that keys are valid
-   - System has fallbacks, so it should still work
+   - Cohere API key is already configured in the app
+   - Only set GEMINI_API_KEY if you want to use Gemini (optional)
+   - System has fallbacks, so it should still work without any API keys
 
 4. **Cold Start Issues**:
    - Free tier has cold starts (first request takes 30-60 seconds)
