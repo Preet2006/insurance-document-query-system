@@ -3,7 +3,7 @@ services:
     name: insurance-document-query-system
     env: python
     buildCommand: pip install -r backend/requirements.txt
-    startCommand: python start_server.py
+          startCommand: python minimal_start.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
