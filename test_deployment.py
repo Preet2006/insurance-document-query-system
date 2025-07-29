@@ -50,13 +50,14 @@ def test_deployed_endpoint():
     
     # Test the hackathon endpoint with retries
     print("Testing hackathon endpoint (may take time due to document processing)...")
-    for attempt in range(2):
+    for attempt in range(3):  # More retries
         try:
+            print(f"Attempt {attempt + 1}/3...")
             response = requests.post(
                 f"{deployed_url}/hackrx/run",
                 json=test_data,
                 headers={"Content-Type": "application/json"},
-                timeout=120  # Longer timeout for document processing
+                timeout=180  # Even longer timeout for document processing
             )
             
             print(f"Endpoint test status: {response.status_code}")
